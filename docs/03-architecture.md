@@ -4,37 +4,64 @@
 
 Ce POC démontre qu'un **Horizontal Pod Autoscaler (HPA)** Kubernetes peut ajuster le nombre de réplicas à partir de métriques applicatives ou de charge externe, **sans KEDA**, au moyen des APIs de métriques Kubernetes.
 
-Le socle déjà validé couvre : FastAPI instrumentée, découverte par `ServiceMonitor`, collecte Prometheus, transformation par Prometheus Adapter et lecture de `http_requests_per_second` via l'API Kubernetes `custom.metrics.k8s.io`. L'autoscaling effectif et les métriques externes constituent les prochains scénarios de démonstration.
+Le socle déjà validé couvre : FastAPI instrumentée, découverte par `ServiceMonitor`, collecte Prometheus, transformation par Prometheus Adapter et lecture de `http_requests_per_second` via l'API Kubernetes `custom.metrics.k8s.io`. L'autoscaling HPA RPS (montée et descente en charge) a également été validé avec k6. La comparaison des signaux CPU/RPS et les External Metrics restent à expérimenter.
 
 Ce document décrit **pourquoi les composants existent et comment ils interagissent**. Les commandes reproductibles figurent dans [01-installation.md](01-installation.md) et les manipulations de charge et HPA dans [02-demonstration.md](02-demonstration.md).
 
 ## 2. Vue d'ensemble
 
+Le diagramme suivant privilégie un **flux fonctionnel de gauche à droite**, organisé en trois domaines. Les flèches indiquent le déplacement logique des données ou les actions de contrôle, pas systématiquement l'initiateur de la requête HTTP.
+
 ```mermaid
-flowchart TB
-    LOAD["k6 / curl<br/>Génération de trafic"] -->|HTTP| SVC["Service Kubernetes"]
-    SVC --> APP["Pods FastAPI<br/>/work · /metrics"]
+flowchart LR
+    subgraph APP["📦 Charge applicative"]
+        direction TB
+        LOAD["⚡ k6 / curl"]
+        SVC["Service Kubernetes"]
+        POD["🖥️ Pods FastAPI<br/>/work et /metrics"]
+        LOAD -->|"HTTP /work"| SVC
+        SVC -->|"Distribue les requêtes"| POD
+    end
 
-    OP["Prometheus Operator<br/>réconciliation"] -.->|configure| PROM["Prometheus<br/>collecte · stockage · PromQL"]
-    SM["ServiceMonitor<br/>sélection des Services"] -.->|décrit les cibles| OP
-    PROM -->|scrape HTTP /metrics| APP
+    subgraph OBS["🔭 Observabilité"]
+        direction TB
+        SM["ServiceMonitor<br/>Découverte des cibles"]
+        PROM["📈 Prometheus<br/>Scrape, stockage, PromQL"]
+        AD["⚙️ Prometheus Adapter<br/>Custom Metrics par Pod"]
+        SM -.->|"Configure les cibles de collecte"| PROM
+        PROM -->|"Requête PromQL de l'Adapter"| AD
+    end
 
-    AD["Prometheus Adapter<br/>règles de traduction"] -->|requêtes PromQL| PROM
-    API["API Server Kubernetes<br/>API aggregation"] -->|Custom / External Metrics API| AD
-    CTRL["Contrôleur HPA<br/>kube-controller-manager"] -->|lecture périodique| API
-    HPA["Objet HorizontalPodAutoscaler<br/>cible et politiques"] -.->|configuration| CTRL
-    CTRL -->|mise à jour du sous-objet scale| DEP["Deployment<br/>replicas souhaités"]
-    DEP -.->|gère| APP
+    subgraph K8S["☸️ Contrôle Kubernetes"]
+        direction TB
+        API["🔌 API aggregation<br/>custom.metrics.k8s.io"]
+        HPA["📈 HPA<br/>Métriques, cible et politiques"]
+        DEP["📦 Deployment / ReplicaSet<br/>Replicas souhaités"]
+        API -->|"RPS par Pod"| HPA
+        HPA -->|"Écriture sur le sous-objet Scale"| DEP
+    end
 
-    classDef validated fill:#e7f4ed,stroke:#208453,color:#17392a;
-    classDef future fill:#fff4da,stroke:#b8871d,color:#483308,stroke-dasharray:5 3;
-    class APP,SVC,SM,OP,PROM,AD,API validated;
-    class LOAD,CTRL,HPA,DEP future;
+    POD -->|"Métriques exposées<br/>Scrape Pull par Prometheus"| PROM
+    AD -->|"Implémente l'API Custom Metrics"| API
+
+    style APP fill:#e8f2ff,stroke:#3b82f6,color:#172b4d
+    style OBS fill:#e9f8ee,stroke:#27a363,color:#172b4d
+    style K8S fill:#f3edff,stroke:#8055d4,color:#172b4d
 ```
 
-> **Lecture :** les flèches pleines indiquent les échanges ou consultations. Les flèches pointillées indiquent la configuration ou la gestion. Les composants HPA et les scénarios de charge seront validés dans le storyboard. Le contrôleur HPA fait déjà partie du plan de contrôle Kubernetes ; ce qui reste à valider est sa boucle de décision pour notre application.
+**Lecture du schéma :**
 
-**Point clé :** Prometheus **scrape** l'application (pull) ; Prometheus Adapter **interroge** Prometheus ; le contrôleur HPA **interroge** les APIs Kubernetes. Ce n'est pas Prometheus qui pousse directement des ordres au HPA.
+1. **Charge :** k6 appelle `/work` via le Service Kubernetes ; les Pods FastAPI mettent à jour leurs métriques.
+2. **Collecte :** `/metrics` expose des compteurs, jauges et histogrammes. Prometheus initie périodiquement un `GET /metrics` (**Pull**) sur les endpoints découverts à partir du `ServiceMonitor`.
+3. **Calcul :** lors d'une lecture de métrique, le Prometheus Adapter exécute une requête PromQL auprès de Prometheus, par exemple `rate(...[1m])`, puis associe les valeurs aux Pods.
+4. **Publication :** l'Adapter sert `custom.metrics.k8s.io` au travers de l'**API aggregation** du serveur API Kubernetes. L'API n'historise pas ces séries.
+5. **Décision :** le contrôleur HPA lit cette API, compare le RPS moyen par Pod à la cible et met à jour le sous-objet `scale` du Deployment ; ses contrôleurs créent ou suppriment ensuite les Pods.
+
+La boucle de rétroaction (nouveaux Pods → nouvelle capacité → nouvelles métriques) est détaillée dans le **diagramme de séquence en section 6**, plutôt que représentée par une flèche de retour qui déformerait le schéma d'ensemble.
+
+Le `ServiceMonitor` est une ressource de configuration consommée par **Prometheus Operator** pour configurer les cibles de Prometheus. Il ne collecte pas lui-même les métriques.
+
+> **Point clé :** Prometheus **scrape** l'application (Pull) ; le Prometheus Adapter **interroge** Prometheus ; le contrôleur HPA **interroge l'API Kubernetes**. Prometheus ne donne aucun ordre de scaling.
 
 ## 3. Responsabilités et frontières
 
@@ -148,7 +175,7 @@ Dans le POC, l'appel à :
 
 a renvoyé une `MetricValueList` avec une valeur `6614m` pour un Pod, soit **6,614 requêtes par seconde**. La notation `m` exprime des milli-unités Kubernetes : ce n'est pas une durée en millisecondes.
 
-**Jalon établi :** FastAPI → ServiceMonitor → Prometheus → Prometheus Adapter → API Custom Metrics Kubernetes. Aucun HPA n'était nécessaire à cette validation.
+**Jalon établi à cette étape :** FastAPI → ServiceMonitor → Prometheus → Prometheus Adapter → API Custom Metrics Kubernetes. La lecture de cette API a été validée indépendamment du HPA ; les essais ultérieurs ont ensuite validé le scaling piloté par les RPS.
 
 ## 6. Boucle de décision du HPA
 
@@ -223,10 +250,11 @@ L'objectif de transposition est de conserver la définition des politiques HPA e
 | FastAPI, ServiceMonitor et collecte Prometheus | **Validé** |
 | Initialisation des compteurs à zéro | **Validé** |
 | Découverte et lecture Custom Metrics Kubernetes | **Validé** |
-| Déploiement HPA et scaling RPS effectif | **À démontrer** |
+| Déploiement HPA et scaling RPS effectif | **Validé** |
 | Comparaison CPU / RPS | **À démontrer** |
 | External Metrics et file simulée | **À démontrer** |
-| Scénarios k6, performances et limites | **À démontrer** |
+| Premiers scénarios k6 (montée et descente HPA RPS) | **Validés** |
+| Calibrage, performances et comparaisons systématiques | **À démontrer** |
 
 - [Installation reproductible](01-installation.md)
 - [Storyboard de démonstration](02-demonstration.md)
