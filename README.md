@@ -11,18 +11,41 @@ Le POC permet d'expérimenter différents signaux d'autoscaling, de simuler des 
 ## Architecture
 
 ```mermaid
-flowchart TB
-    K6["k6 — Générateur de charge"] -->|"Requêtes HTTP"| APP["FastAPI — Application instrumentée"]
-    PROM["Prometheus"] -->|"GET /metrics — Pull"| APP
-    APP -.->|"Compteurs, jauges et histogrammes"| PROM
-    ADAPTER["Prometheus Adapter"] -->|"Requêtes PromQL"| PROM
-    PROM -.->|"Valeurs calculées en RPS"| ADAPTER
-    HPA["Horizontal Pod Autoscaler"] -->|"Lecture via custom.metrics.k8s.io"| API["API Kubernetes — Custom Metrics"]
-    API <-->|"API servie par l'Adapter"| ADAPTER
-    API -.->|"Valeur de la métrique"| HPA
-    HPA -->|"Mise à jour du nombre de replicas"| DEP["Deployment / ReplicaSet"]
-    DEP -.->|"Création et suppression des Pods"| APP
+flowchart LR
+    subgraph A["📦 Application"]
+        direction TB
+        K6["⚡ k6<br/>Charge HTTP"]
+        APP["🖥️ FastAPI<br/>Application instrumentée"]
+        MET["📊 /metrics<br/>Compteurs et histogrammes"]
+        K6 -->|"Requêtes HTTP"| APP
+        APP -->|"Expose"| MET
+    end
+
+    subgraph O["🔭 Observabilité"]
+        direction TB
+        PROM["📈 Prometheus<br/>Collecte et PromQL"]
+        AD["⚙️ Prometheus Adapter<br/>RPS par Pod"]
+        PROM -->|"Interrogation PromQL"| AD
+    end
+
+    subgraph K["☸️ Kubernetes"]
+        direction TB
+        API["🔌 Custom Metrics API"]
+        HPA["📈 HPA<br/>Calcul des replicas"]
+        DEP["📦 Deployment / ReplicaSet"]
+        API -->|"RPS par Pod"| HPA
+        HPA -->|"Replicas désirés"| DEP
+    end
+
+    MET -->|"Métriques collectées<br/>en Pull par Prometheus"| PROM
+    AD -->|"Implémente Custom Metrics"| API
+
+    style A fill:#e8f2ff,stroke:#3b82f6,color:#172b4d
+    style O fill:#e9f8ee,stroke:#27a363,color:#172b4d
+    style K fill:#f3edff,stroke:#8055d4,color:#172b4d
 ```
+
+Le schéma présente le **flux fonctionnel** de gauche à droite : Prometheus lance un `GET /metrics` (Pull), l'Adapter fournit les valeurs à l'API Kubernetes, puis le HPA met à jour le nombre de replicas du Deployment. Le ReplicaSet crée ou supprime alors les Pods. Les appels détaillés sont décrits dans la [documentation d'architecture](docs/03-architecture.md).
 
 **Stack actuelle :** Kubernetes (kind), FastAPI, Prometheus, Prometheus Adapter, Metrics Server, HPA (`autoscaling/v2`) et k6.
 
